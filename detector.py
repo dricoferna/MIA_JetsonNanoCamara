@@ -1,150 +1,197 @@
+"""
+Detector de presencia para Jetson Nano
+Detecta objetos EN MOVIMIENTO y objetos QUIETOS/ESTÁTICOS.
+Compatible con Python 3.6.9
+
+Estrategia dual:
+  1. Diff frame-a-frame  → detecta movimiento (igual que antes, fiable)
+  2. Diff contra frame de hace N segundos → detecta objetos que se quedaron quietos
+  Si cualquiera de los dos dispara, hay objeto.
+"""
+
 import cv2
 import numpy as np
 import time
+from collections import deque
 
 # ─────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────
-UMBRAL_AREA       = 1500
-SENSIBILIDAD      = 25
-MOSTRAR_VENTANA   = True
-INTERVALO_LOG     = 2.0
+CAMARA_ID           = 0      # Índice de cámara (0 = primera cámara)
+UMBRAL_AREA         = 1500   # Área mínima (px²) para considerar detección válida
+SENSIBILIDAD        = 25     # Umbral de diferencia de píxeles
+MOSTRAR_VENTANA     = True   # Mostrar ventana (requiere entorno gráfico)
+INTERVALO_LOG       = 2.0    # Segundos entre mensajes de consola
 
-FRAMES_CALIBRACION = 60
-ALPHA_FONDO        = 0.002
+# Detección de objeto estático:
+# Se compara el frame actual con el frame de hace SEGUNDOS_REFERENCIA segundos.
+# Si la escena cambió (entró un objeto y se quedó), esa diferencia persiste.
+SEGUNDOS_REFERENCIA = 2.0    # Cuántos segundos atrás mirar para detectar estáticos
+FPS_ESTIMADO        = 30     # FPS aproximados de tu cámara (para calcular tamaño del buffer)
+
+# Pipeline GStreamer para cámara CSI del Jetson Nano
+# Si usas cámara USB, el código hace fallback automático
+GSTREAMER_PIPELINE = (
+    "nvarguscamerasrc ! "
+    "video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! "
+    "nvvidconv ! "
+    "video/x-raw, format=BGRx ! "
+    "videoconvert ! "
+    "video/x-raw, format=BGR ! "
+    "appsink"
+)
 
 
-# ─────────────────────────────────────────
-# APERTURA DE CÁMARA (FIX REAL)
-# ─────────────────────────────────────────
 def abrir_camara():
-    for i in range(3):
-        print(f"[INFO] Probando cámara índice {i}...")
+    """Intenta abrir cámara CSI primero, luego USB como fallback."""
+    cap = cv2.VideoCapture(GSTREAMER_PIPELINE, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        print("[INFO] Cámara CSI abierta con GStreamer.")
+        return cap
 
-        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(CAMARA_ID)
+    if cap.isOpened():
+        print("[INFO] Cámara USB abierta.")
+        return cap
 
-        if cap.isOpened():
-            # Forzar MJPG (CLAVE)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                print(f"[OK] Cámara funcionando en índice {i}")
-                return cap
-
-        cap.release()
-
-    raise RuntimeError("No se pudo abrir ninguna cámara funcional")
+    raise RuntimeError("No se pudo abrir ninguna cámara. Verifica la conexión.")
 
 
-# ─────────────────────────────────────────
-# PROCESAMIENTO
-# ─────────────────────────────────────────
 def preprocesar(frame):
+    """Convierte el frame a escala de grises y aplica blur para reducir ruido."""
     gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gris = cv2.GaussianBlur(gris, (21, 21), 0)
     return gris
 
 
-def detectar_objeto(frame_gris, fondo_float):
-    fondo_uint8 = cv2.convertScaleAbs(fondo_float)
-    diferencia  = cv2.absdiff(fondo_uint8, frame_gris)
-
-    _, umbral = cv2.threshold(diferencia, SENSIBILIDAD, 255, cv2.THRESH_BINARY)
+def calcular_contornos(diff_gris):
+    """Aplica umbral y devuelve contornos válidos a partir de una imagen de diferencia."""
+    _, umbral = cv2.threshold(diff_gris, SENSIBILIDAD, 255, cv2.THRESH_BINARY)
     umbral = cv2.dilate(umbral, None, iterations=2)
-
     contornos, _ = cv2.findContours(
         umbral.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
-
-    contornos_validos = [c for c in contornos if cv2.contourArea(c) > UMBRAL_AREA]
-
-    return len(contornos_validos) > 0, contornos_validos, umbral
+    validos = [c for c in contornos if cv2.contourArea(c) > UMBRAL_AREA]
+    return validos, umbral
 
 
-def actualizar_fondo(fondo_float, frame_gris, hay_objeto):
-    if not hay_objeto:
-        cv2.accumulateWeighted(frame_gris, fondo_float, ALPHA_FONDO)
-    return fondo_float
+def detectar(frame_gris, frame_anterior_gris, frame_viejo_gris):
+    """
+    Detección dual:
+      - diff_reciente: frame actual vs frame anterior  → movimiento
+      - diff_viejo:    frame actual vs frame de hace N s → objeto estático
+    Devuelve (hay_objeto, contornos, mascara_combinada)
+    """
+    # 1. Diferencia con frame inmediatamente anterior (movimiento)
+    diff_reciente = cv2.absdiff(frame_anterior_gris, frame_gris)
+    contornos_mov, mascara_mov = calcular_contornos(diff_reciente)
+
+    # 2. Diferencia con frame antiguo (objeto estático que entró hace tiempo)
+    diff_viejo = cv2.absdiff(frame_viejo_gris, frame_gris)
+    contornos_est, mascara_est = calcular_contornos(diff_viejo)
+
+    # Combinar máscaras para visualización
+    mascara_combinada = cv2.bitwise_or(mascara_mov, mascara_est)
+
+    # Hay objeto si cualquiera de los dos detecta algo
+    hay_objeto = len(contornos_mov) > 0 or len(contornos_est) > 0
+
+    # Para dibujar, usar los contornos del canal que disparó
+    contornos = contornos_mov if contornos_mov else contornos_est
+
+    return hay_objeto, contornos, mascara_combinada
 
 
 def dibujar_detecciones(frame, contornos):
+    """Dibuja rectángulos alrededor de los objetos detectados."""
     for contorno in contornos:
         (x, y, w, h) = cv2.boundingRect(contorno)
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
     return frame
 
 
-# ─────────────────────────────────────────
-# CALIBRACIÓN
-# ─────────────────────────────────────────
-def calibrar_fondo(cap):
-    print(f"[CALIBRACIÓN] {FRAMES_CALIBRACION} frames...")
-
-    fondo = None
-
-    for i in range(FRAMES_CALIBRACION):
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-
-        gris = preprocesar(frame)
-
-        if fondo is None:
-            fondo = gris.astype(np.float32)
-        else:
-            cv2.accumulateWeighted(gris, fondo, 0.1)
-
-    print("[OK] Fondo calibrado\n")
-    return fondo
-
-
-# ─────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────
 def main():
-    print("=== DETECTOR DE PRESENCIA (FIX USB) ===")
+    print("=" * 50)
+    print("  DETECTOR DE PRESENCIA - Jetson Nano")
+    print("  (movimiento + objetos estáticos)")
+    print("=" * 50)
 
     cap = abrir_camara()
 
-    fondo_float = calibrar_fondo(cap)
+    # Leer primer frame
+    ret, frame_inicial = cap.read()
+    if not ret:
+        raise RuntimeError("No se pudo leer el primer frame de la cámara.")
+
+    gris_inicial = preprocesar(frame_inicial)
+
+    # Buffer circular: guarda los últimos N frames preprocesados.
+    # El frame más antiguo del buffer actúa como referencia estática.
+    tam_buffer = max(2, int(FPS_ESTIMADO * SEGUNDOS_REFERENCIA))
+    buffer = deque([gris_inicial] * tam_buffer, maxlen=tam_buffer)
 
     estado_anterior = None
-    ultimo_log = 0
+    ultimo_log      = 0.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
+    print(f"[INFO] Buffer estático: {tam_buffer} frames (~{SEGUNDOS_REFERENCIA}s)")
+    print("[INFO] Iniciando detección. Pulsa Ctrl+C (o 'q') para salir.\n")
 
-        frame_gris = preprocesar(frame)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[WARN] No se pudo leer frame. Reintentando...")
+                time.sleep(0.1)
+                continue
 
-        hay_objeto, contornos, mascara = detectar_objeto(frame_gris, fondo_float)
+            frame_gris = preprocesar(frame)
 
-        fondo_float = actualizar_fondo(fondo_float, frame_gris, hay_objeto)
+            # frame anterior = último añadido al buffer
+            # frame viejo    = el más antiguo del buffer (hace ~SEGUNDOS_REFERENCIA)
+            frame_anterior_gris = buffer[-1]
+            frame_viejo_gris    = buffer[0]
 
-        ahora = time.time()
-        if hay_objeto != estado_anterior or (ahora - ultimo_log) > INTERVALO_LOG:
-            print("OBJETO" if hay_objeto else "SIN OBJETO")
-            estado_anterior = hay_objeto
-            ultimo_log = ahora
+            hay_objeto, contornos, mascara = detectar(
+                frame_gris, frame_anterior_gris, frame_viejo_gris
+            )
 
+            # Añadir frame actual al buffer
+            buffer.append(frame_gris)
+
+            # ── Log por consola (throttled) ───────────────────────────────────
+            ahora = time.time()
+            if hay_objeto != estado_anterior or (ahora - ultimo_log) > INTERVALO_LOG:
+                estado_str = "⚠  OBJETO DETECTADO" if hay_objeto else "✓  Sin objeto"
+                print(f"[{time.strftime('%H:%M:%S')}] {estado_str}")
+                estado_anterior = hay_objeto
+                ultimo_log      = ahora
+
+            # ── Visualización opcional ────────────────────────────────────────
+            if MOSTRAR_VENTANA:
+                frame_vis = frame.copy()
+                if hay_objeto:
+                    frame_vis = dibujar_detecciones(frame_vis, contornos)
+                    cv2.putText(frame_vis, "OBJETO DETECTADO", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                else:
+                    cv2.putText(frame_vis, "Sin objeto", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                cv2.imshow("Detector - frame",  frame_vis)
+                cv2.imshow("Detector - mascara", mascara)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    print("[INFO] Saliendo por tecla 'q'.")
+                    break
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrumpido por el usuario.")
+
+    finally:
+        cap.release()
         if MOSTRAR_VENTANA:
-            frame_vis = frame.copy()
-
-            if hay_objeto:
-                frame_vis = dibujar_detecciones(frame_vis, contornos)
-
-            cv2.imshow("Frame", frame_vis)
-            cv2.imshow("Mascara", mascara)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.destroyAllWindows()
+        print("[INFO] Recursos liberados. Fin del programa.")
 
 
 if __name__ == "__main__":
