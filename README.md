@@ -122,8 +122,9 @@ Abrir y ejecutar `modelo-latas-final.ipynb` en Jupyter. Genera `modelo_latas.h5`
 ### 3. Ejecutar la detección en tiempo real
 
 ```bash
-python EJECUCION-CAMARA.py
+python EJECUCION-CAMARA-RASPBERRY.py
 ```
+Se peuden observar dos archivos similares en el repositorio, el que funciona en el RaspBerry es el que he dicho el otro funciona en windows.
 
 Parámetros configurables al inicio del fichero:
 
@@ -138,16 +139,14 @@ Presiona **Q** o **Esc** para cerrar la ventana.
 
 ## ⚠️ Problemas Encontrados
 
-- **Muchos problemas al importar las librerias tanto al JetsonNano como a la Raspberry
+- **Muchos problemas al importar las librerias tanto al JetsonNano como a la RaspBerry
 - **Necesidad de comprar latas para crear el dataset
+- **Fallos constantes en la cámara al ejecutar el programa en la RaspBerry
 
 ---
 
 ## 🔮 Posibles Mejoras Futuras
 
 - **Aumento del dataset**: utilizar una mayor cantidad de latas incluyendo bebidas alcoholicas.
-- **Detección con bounding box**: reemplazar el ROI fijo por un detector de objetos (p. ej. YOLOv8) para localizar la lata en cualquier parte del frame.
-- **Ampliar el dataset**: añadir más marcas y variantes (latas dañadas, parcialmente tapadas) para un uso más real.
-- **Exportar a TFLite / ONNX**: reducir el tamaño del modelo para ejecución en dispositivos móviles o embebidos (Raspberry Pi, Jetson Nano).
-- **Interfaz web**: exponer el detector como servicio REST con Flask/FastAPI para integrarlo en sistemas externos.
-- **Historial de detecciones**: registrar las predicciones en CSV o base de datos para análisis posterior (p. ej. inventario automático).
+- **Uso profesional**: en el caso de que se quisiera utilizar en una fábrica se podria hacer algo con los datos que extrae la cámara, por ejemplo, redirigir las latas para reciclar las del mismo tipo.
+
